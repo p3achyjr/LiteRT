@@ -33,6 +33,7 @@
 #include "absl/container/flat_hash_map.h"  // from @com_google_absl
 #include "absl/container/flat_hash_set.h"  // from @com_google_absl
 #include "litert/c/options/litert_cpu_options.h"
+#include "litert/cc/internal/litert_dispatch_delegate_vendor_options.h"
 #include "tflite/c/c_api.h"
 #include "tflite/mutable_op_resolver.h"
 
@@ -990,6 +991,21 @@ LiteRtCompiledModelT::Create(LiteRtEnvironmentT* env, LiteRtModel model,
           compiled_model->fb_model_file_offset_));
       LITERT_RETURN_IF_ERROR(
           dispatch_options.SetAllocBaseSize(compiled_model->fb_model_size_));
+    }
+    LITERT_ASSIGN_OR_RETURN(
+        litert::internal::DispatchDelegateVendorOptions vendor_options,
+        litert::internal::BuildDispatchDelegateVendorOptions(
+            compiled_model->interp_.get(), *model));
+    if (!vendor_options.FunctionMappings().empty()) {
+      const char* identifier = nullptr;
+      void* payload = nullptr;
+      void (*payload_deleter)(void*) = nullptr;
+      LITERT_RETURN_IF_ERROR(vendor_options.GetOpaqueOptionsData(
+          &identifier, &payload, &payload_deleter));
+      LITERT_ASSIGN_OR_RETURN(
+          litert::OpaqueOptions vendor_node,
+          litert::OpaqueOptions::Create(identifier, payload, payload_deleter));
+      LITERT_RETURN_IF_ERROR(scoped_modifier.Append(std::move(vendor_node)));
     }
     LITERT_RETURN_IF_ERROR(scoped_modifier.Append(std::move(dispatch_options)));
   }

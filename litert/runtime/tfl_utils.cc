@@ -15,15 +15,22 @@
 #include "litert/runtime/tfl_utils.h"
 
 #include <cstddef>
-#include <cstring>
+#include <string>
+#include <utility>
 
-#include "absl/strings/str_cat.h"  // from @com_google_absl
+#include "absl/strings/string_view.h"  // from @com_google_absl
+#include "absl/strings/substitute.h"  // from @com_google_absl
 #include "litert/c/internal/litert_logging.h"
 #include "litert/c/litert_common.h"
 #include "litert/c/litert_layout.h"
 #include "litert/c/litert_model_types.h"
+#include "litert/c/litert_op_code.h"
 #include "litert/cc/litert_expected.h"
-#include "litert/core/options.h"
+#include "litert/cc/litert_macros.h"
+#include "litert/cc/internal/litert_dispatch_delegate_vendor_options.h"
+#include "litert/core/build_stamp.h"
+#include "litert/core/dispatch_op_schema.h"
+#include "litert/core/model/model.h"
 #include "litert/runtime/tensor_identifier.h"
 #include "tflite/c/c_api_opaque.h"
 #include "tflite/c/c_api_types.h"
@@ -135,6 +142,75 @@ Expected<TfLiteTensorIdentifier> GetTensorIdentifier(
   }
   return Unexpected(kLiteRtStatusErrorNotFound,
                     "Tensor not found in interpreter");
+}
+
+Expected<DispatchDelegateVendorOptions> BuildDispatchDelegateVendorOptions(
+    const tflite::Interpreter* interpreter, const LiteRtModelT& model) {
+  if (!interpreter) {
+    return Unexpected(kLiteRtStatusErrorInvalidArgument,
+                      "Interpreter must not be null");
+  }
+
+  DispatchDelegateVendorOptions vendor_options;
+
+  // It is OK not to have any signatures. We are building the map only for
+  // signature-aware models.
+  if (interpreter->signature_keys().empty()) {
+    return vendor_options;
+  }
+  // Go over the list of signature keys.
+  for (const std::string* sig_key : interpreter->signature_keys()) {
+    if (sig_key == nullptr) {
+      return Unexpected(kLiteRtStatusErrorInvalidArgument,
+                        "Encountered null signature key in interpreter");
+    }
+    int sg_idx = interpreter->GetSubgraphIndexFromSignature(sig_key->c_str());
+    if (sg_idx < 0 || sg_idx >= model.Subgraphs().size()) {
+      return Unexpected(
+          kLiteRtStatusErrorNotFound,
+          absl::Substitute("Invalid subgraph index $0 for signature $1", sg_idx,
+                           *sig_key));
+    }
+    const LiteRtSubgraphT* subgraph = model.Subgraphs().at(sg_idx);
+    // Go over all ops in the subgraph and pull out the function names.
+    for (LiteRtOp op : subgraph->Ops()) {
+      if (op->OpCode() != kLiteRtOpCodeTflCustom) {
+        continue;
+      }
+      LITERT_ASSIGN_OR_RETURN(absl::string_view custom_code, op->CustomCode());
+      if (custom_code == litert::internal::kLiteRtDispatchOpCustomName &&
+          op->CustomOptions().Size() > 0) {
+        litert::internal::DispatchOpOptions op_opts =
+            litert::internal::GetDispatchOpOptions(op->CustomOptions());
+        if (!op_opts.name.empty()) {
+          FunctionMapping mapping;
+          mapping.function_name = op_opts.name;
+          mapping.signature_name = *sig_key;
+
+          mapping.input_tensor_ports.reserve(op->Inputs().size());
+          for (int i = 0; i < op->Inputs().size(); ++i) {
+            LiteRtTensor input_tensor = op->Inputs()[i];
+            if (!input_tensor->Name().empty()) {
+              mapping.input_tensor_ports.push_back(
+                  {std::string(input_tensor->Name()), i});
+            }
+          }
+
+          mapping.output_tensor_ports.reserve(op->Outputs().size());
+          for (int i = 0; i < op->Outputs().size(); ++i) {
+            LiteRtTensor output_tensor = op->Outputs()[i];
+            if (!output_tensor->Name().empty()) {
+              mapping.output_tensor_ports.push_back(
+                  {std::string(output_tensor->Name()), i});
+            }
+          }
+
+          vendor_options.AddFunctionMapping(std::move(mapping));
+        }
+      }
+    }
+  }
+  return vendor_options;
 }
 
 }  // namespace litert::internal
