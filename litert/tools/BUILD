@@ -47,6 +47,7 @@ exports_files([
 #     srcs = ["externalize_tflite_flatbuffer.py"],
 #     deps = [
 #         "//third_party/py/flatbuffers",
+#         "//third_party/py/numpy",
 #         "//tflite/python:schema_py",
 #     ],
 # )
@@ -56,6 +57,7 @@ exports_files([
 #     srcs = ["externalize_tflite_flatbuffer.py"],
 #     deps = [
 #         "//third_party/py/flatbuffers",
+#         "//third_party/py/numpy",
 #         "//tflite/python:schema_py",
 #     ],
 # )
@@ -67,6 +69,7 @@ exports_files([
 #         ":externalize_tflite_flatbuffer_lib",
 #         "@absl_py//absl/testing:absltest",
 #         "//third_party/py/flatbuffers",
+#         "//third_party/py/numpy",
 #         "//tflite/python:schema_py",
 #     ],
 # )
