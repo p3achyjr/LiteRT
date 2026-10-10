@@ -53,6 +53,7 @@ namespace tflite::xnnpack {
 
 namespace {
 constexpr size_t kMinAlignment = 128;
+constexpr char kInMemoryWeightCacheVmaName[] = "xnnpack-weights-cache";
 
 const char* Sanitize(const char* path) { return path ? path : ""; }
 
@@ -164,6 +165,9 @@ bool WeightCacheBuilder::StartBuildStep() {
   XNNPACK_RETURN_CHECK(!is_build_step_.exchange(true),
                        "Failed to start build step: already started. This may "
                        "be a concurrency issue.");
+  // Reset `is_build_step_` if setup fails so subsequent subgraph build steps
+  // do not fail the precondition check above.
+  ScopeGuard reset_build_step_on_fail([this] { is_build_step_ = false; });
 
   // Reload flatbuffer data.
   XNNPackCacheHeader header;
@@ -188,6 +192,7 @@ bool WeightCacheBuilder::StartBuildStep() {
   build_segment_start_ = fd_.SetPos(header.buffer_list_offset);
   XNNPACK_RETURN_CHECK(build_segment_start_ != -1);
 
+  reset_build_step_on_fail.Deactivate();
   return true;
 }
 
@@ -272,6 +277,17 @@ bool WeightCacheBuilder::StopBuildStep() {
   XNNPACK_RETURN_CHECK(is_build_step_,
                        "Attempting to stop a non existing build step. This may "
                        "be a concurrency issue.");
+  // Always reset `is_build_step_` and release the temporary staging buffer
+  // (`data_`) when the step finishes—including on the early return below when
+  // a subsequent subgraph has 100% cache hits (`fd_.GetPos() ==
+  // build_segment_start_`). Otherwise, `is_build_step_` stays true (failing the
+  // next subgraph's `StartBuildStep()`) and `data_` remains allocated in
+  // anonymous heap for the lifetime of the cache provider.
+  ScopeGuard cleanup_build_step([this] {
+    data_.reset(nullptr);
+    capacity_ = 0;
+    is_build_step_ = false;
+  });
   XNNPACK_RETURN_CHECK(fd_.IsValid(), "cache file ('%s') is not open.",
                        file_path_.c_str());
 
@@ -313,7 +329,6 @@ bool WeightCacheBuilder::StopBuildStep() {
   TFLITE_LOG_PROD(tflite::TFLITE_LOG_VERBOSE,
                   "XNNPack weight cache: written to '%s'.", file_path_.c_str());
   first_write_done_ = true;
-  is_build_step_ = false;
   return true;
 }
 
@@ -370,10 +385,18 @@ MMapWeightCacheProvider::MMapWeightCacheProvider(
       XNN_MOVE_CONSTRUCT_MEMBER(file_descriptor_),
       XNN_MOVE_CONSTRUCT_MEMBER(builder_),
       XNN_MOVE_CONSTRUCT_MEMBER(cache_miss_handler_),
-      XNN_MOVE_CONSTRUCT_MEMBER(offset_to_addr_) {
+      XNN_MOVE_CONSTRUCT_MEMBER(offset_to_addr_),
+      XNN_MOVE_CONSTRUCT_MEMBER(in_memory_cache_enabled_),
+      XNN_MOVE_CONSTRUCT_MEMBER(is_in_memory_build_step_),
+      XNN_MOVE_CONSTRUCT_MEMBER(in_memory_build_handle_),
+      XNN_MOVE_CONSTRUCT_MEMBER(in_memory_build_used_),
+      XNN_MOVE_CONSTRUCT_MEMBER(in_memory_build_offsets_) {
   // The contexts need to keep pointing to their owning object.
   cache_provider_.context = this;
   other.cache_provider_.context = &other;
+  other.in_memory_cache_enabled_ = false;
+  other.is_in_memory_build_step_ = false;
+  other.in_memory_build_used_ = 0;
 }
 #undef XNN_MOVE_CONSTRUCT_MEMBER
 
@@ -395,6 +418,14 @@ MMapWeightCacheProvider& MMapWeightCacheProvider::operator=(
   XNN_MOVE_MEMBER(builder_);
   XNN_MOVE_MEMBER(cache_miss_handler_);
   XNN_MOVE_MEMBER(offset_to_addr_);
+  XNN_MOVE_MEMBER(in_memory_cache_enabled_);
+  XNN_MOVE_MEMBER(is_in_memory_build_step_);
+  XNN_MOVE_MEMBER(in_memory_build_handle_);
+  XNN_MOVE_MEMBER(in_memory_build_used_);
+  XNN_MOVE_MEMBER(in_memory_build_offsets_);
+  other.in_memory_cache_enabled_ = false;
+  other.is_in_memory_build_step_ = false;
+  other.in_memory_build_used_ = 0;
 #undef XNN_MOVE_MEMBER
   return *this;
 }
@@ -461,14 +492,27 @@ bool MMapWeightCacheProvider::LoadOrStartBuild(const char* path,
 bool MMapWeightCacheProvider::StartBuild(const char* path, FileDescriptor fd) {
   const char* const safe_path = Sanitize(path);
   SetFilePath(safe_path);
+  cache_key_to_offset_.clear();
+  offset_to_addr_.clear();
+  mmap_handles_.clear();
+  cache_miss_handler_ = CacheMissHandler();
+  mmap_buffer_base_offset_ = 0;
+  in_memory_cache_enabled_ = false;
+  is_in_memory_build_step_ = false;
+  in_memory_build_used_ = 0;
+  in_memory_build_offsets_.clear();
+  in_memory_build_handle_.UnMap();
+
+  if (!fd.IsValid() && IsInMemoryCachePath(file_path_)) {
+    file_descriptor_.Close();
+    builder_.Reset();
+    in_memory_cache_enabled_ = true;
+    return true;
+  }
 
   if (!fd.IsValid()) {
-    if (IsInMemoryCachePath(file_path_)) {
-      fd = CreateInMemoryFileDescriptor("XNNPack in-memory weight cache");
-    } else {
-      fd = FileDescriptor::Open(file_path_.c_str(), O_CREAT | O_TRUNC | O_RDWR,
-                                0644);
-    }
+    fd = FileDescriptor::Open(file_path_.c_str(), O_CREAT | O_TRUNC | O_RDWR,
+                              0644);
   }
   XNNPACK_RETURN_CHECK(fd.IsValid(), "could not open file ('%s'): %s.",
                        file_path_.c_str(), strerror(errno));
@@ -662,10 +706,39 @@ bool MMapWeightCacheProvider::StartBuildStep() {
   if (IsBuilding()) {
     return true;
   }
+  if (in_memory_cache_enabled_) {
+    in_memory_build_used_ = 0;
+    in_memory_build_offsets_.clear();
+    in_memory_build_handle_.UnMap();
+    is_in_memory_build_step_ = true;
+    return true;
+  }
   return builder_.StartBuildStep();
 }
 
 bool MMapWeightCacheProvider::StopBuildStep() {
+  if (is_in_memory_build_step_) {
+    ScopeGuard cleanup_in_memory_step([this] {
+      is_in_memory_build_step_ = false;
+      in_memory_build_used_ = 0;
+      in_memory_build_offsets_.clear();
+      in_memory_build_handle_.UnMap();
+    });
+    if (in_memory_build_offsets_.empty()) {
+      return true;
+    }
+    XNNPACK_RETURN_CHECK(in_memory_build_handle_.FinalizeAnonymous(
+        std::max<size_t>(in_memory_build_used_, 1),
+        kInMemoryWeightCacheVmaName));
+    for (const auto& [global_offset, rel_offset] : in_memory_build_offsets_) {
+      offset_to_addr_.insert_or_assign(
+          global_offset, in_memory_build_handle_.data() + rel_offset);
+    }
+    mmap_buffer_base_offset_ += Align(in_memory_build_used_, kMinAlignment);
+    cache_miss_handler_.SetMinOffset(mmap_buffer_base_offset_ + 1);
+    mmap_handles_.push_back(std::move(in_memory_build_handle_));
+    return true;
+  }
   XNNPACK_RETURN_CHECK(builder_.StopBuildStep());
 #if defined(XNNPACK_CACHE_NO_FILE_MAPPING_FOR_DEBUG)
   if (!mmap_handles_.empty()) {
@@ -688,6 +761,30 @@ bool MMapWeightCacheProvider::MapTensorIdentifiers(
     const TfLiteTensor& t = tensors[index];
     XNNPACK_RETURN_CHECK(MapBufferIdentifier(t.data.data, t.bytes, identifier));
   }
+  if (IsInMemoryCachePath(file_path_) && tensors != nullptr) {
+    // In-memory weight caches never serialize across processes, so constant
+    // tensors constructed programmatically without a FlatBuffer buffer table
+    // entry (e.g., in C++ unit tests or runtime-generated graphs) can safely
+    // use their tagged address as a synthetic identifier with size=0 (avoiding
+    // MADV_PAGEOUT on stack/heap buffers).
+    constexpr uint64_t kSyntheticBufferIdTag = uint64_t{1} << 63;
+    for (size_t i = 0; i < size; ++i) {
+      if (tensor_index_to_identifier.find(i) !=
+          tensor_index_to_identifier.end()) {
+        continue;
+      }
+      const TfLiteTensor& t = tensors[i];
+      if (t.allocation_type == kTfLiteMmapRo && t.data.data != nullptr &&
+          buffer_address_to_identifier_.find(t.data.data) ==
+              buffer_address_to_identifier_.end()) {
+        const uint64_t synthetic_id =
+            (static_cast<uint64_t>(reinterpret_cast<uintptr_t>(t.data.data)) |
+             kSyntheticBufferIdTag);
+        XNNPACK_RETURN_CHECK(
+            MapBufferIdentifier(t.data.data, /*size=*/0, synthetic_id));
+      }
+    }
+  }
   return true;
 }
 
@@ -697,7 +794,7 @@ bool MMapWeightCacheProvider::MapBufferIdentifier(const void* buffer,
   if (!buffer) {
     return false;
   }
-  buffer_address_to_identifier_.emplace(
+  buffer_address_to_identifier_.insert_or_assign(
       buffer, OriginalBufferMetadata{identifier, size});
   return true;
 }
@@ -725,6 +822,40 @@ size_t MMapWeightCacheProvider::LookUp(
 }
 
 void* MMapWeightCacheProvider::ReserveSpace(size_t size) {
+  if (is_in_memory_build_step_) {
+    const size_t aligned_offset = Align(in_memory_build_used_, kMinAlignment);
+    const size_t required_size = aligned_offset + std::max<size_t>(size, 1);
+    if (!in_memory_build_handle_.IsMapped()) {
+      if (!in_memory_build_handle_.MapAnonymous(required_size,
+                                                kInMemoryWeightCacheVmaName)) {
+        return nullptr;
+      }
+    } else if (required_size > in_memory_build_handle_.size()) {
+#if (defined(__linux__) || defined(__ANDROID__)) && \
+    !defined(XNNPACK_CACHE_NO_FILE_MAPPING_FOR_DEBUG)
+      if (!in_memory_build_handle_.ResizeAnonymous(
+              required_size, in_memory_build_used_,
+              kInMemoryWeightCacheVmaName)) {
+        return nullptr;
+      }
+#else
+      const size_t doubled_size = in_memory_build_handle_.size() * 2;
+      const size_t new_capacity = doubled_size > in_memory_build_handle_.size()
+                                      ? std::max(required_size, doubled_size)
+                                      : required_size;
+      if (!in_memory_build_handle_.ResizeAnonymous(
+              new_capacity, in_memory_build_used_,
+              kInMemoryWeightCacheVmaName) &&
+          (new_capacity == required_size ||
+           !in_memory_build_handle_.ResizeAnonymous(
+               required_size, in_memory_build_used_,
+               kInMemoryWeightCacheVmaName))) {
+        return nullptr;
+      }
+#endif
+    }
+    return in_memory_build_handle_.data() + aligned_offset;
+  }
   return builder_.IsBuilding() ? builder_.Reserve(size)
                                : cache_miss_handler_.Reserve(size);
 }
@@ -741,19 +872,62 @@ size_t MMapWeightCacheProvider::LookUpOrInsert(
     return offset_it->second.offset;
   }
 
-  const BufferLocation location =
-      builder_.IsBuilding()
-          ? builder_.Append(pack_id, ptr, size, cache_key->fingerprint_id)
-          : cache_miss_handler_.Append(
-                pack_id, ptr, size, cache_key->fingerprint_id, offset_to_addr_);
+  BufferLocation location = BufferLocation::Invalid();
+  if (is_in_memory_build_step_) {
+    if (cache_key->fingerprint_id == 0) {
+      TFLITE_LOG_PROD(tflite::TFLITE_LOG_ERROR,
+                      "XNNPack weight cache: no fingerprint identifier was set "
+                      "when appending a buffer to the in-memory cache.");
+    } else if (xnn_get_fingerprint(cache_key->fingerprint_id) == nullptr) {
+      TFLITE_LOG_PROD(
+          tflite::TFLITE_LOG_ERROR,
+          "XNNPack weight cache: could not find a fingerprint with id %s when "
+          "appending a buffer to the in-memory cache.",
+          xnn_fingerprint_id_to_string_u32(cache_key->fingerprint_id));
+    } else {
+      const size_t rel_offset = Align(in_memory_build_used_, kMinAlignment);
+      uint8_t* dst = nullptr;
+      if (in_memory_build_handle_.IsMapped() &&
+          ptr == in_memory_build_handle_.data() + rel_offset &&
+          rel_offset + size <= in_memory_build_handle_.size()) {
+        dst = static_cast<uint8_t*>(ptr);
+      } else {
+        dst = static_cast<uint8_t*>(ReserveSpace(size));
+        if (dst != nullptr && ptr != nullptr && dst != ptr && size > 0) {
+          std::memcpy(dst, ptr, size);
+        }
+      }
+      if (dst != nullptr) {
+        const size_t global_offset = mmap_buffer_base_offset_ + rel_offset;
+        location = BufferLocation{/*offset=*/global_offset, /*size=*/size};
+        in_memory_build_offsets_.emplace_back(global_offset, rel_offset);
+        in_memory_build_used_ = rel_offset + size;
+      }
+    }
+  } else if (builder_.IsBuilding()) {
+    location = builder_.Append(pack_id, ptr, size, cache_key->fingerprint_id);
+  } else {
+    location = cache_miss_handler_.Append(
+        pack_id, ptr, size, cache_key->fingerprint_id, offset_to_addr_);
+  }
   XNNPACK_ABORT_CHECK(!location.IsInvalid(),
                       "Inserting data in the cache failed.");
   cache_key_to_offset_.emplace(pack_id, location);
 
   // Signals the system that the original weights are not needed anymore.
   auto SignalDataNotNeeded = [&](const void* data) {
-    if (auto it = buffer_address_to_identifier_.find(data);
-        it != buffer_address_to_identifier_.end()) {
+    if (!data) {
+      return;
+    }
+    auto it = buffer_address_to_identifier_.find(data);
+    for (auto remapped_it = buffer_remaps_.find(data);
+         it == buffer_address_to_identifier_.end() &&
+         remapped_it != buffer_remaps_.end();
+         remapped_it = buffer_remaps_.find(remapped_it->second)) {
+      data = remapped_it->second;
+      it = buffer_address_to_identifier_.find(data);
+    }
+    if (it != buffer_address_to_identifier_.end() && it->second.size > 0) {
       MarkMemoryNotNeeded(const_cast<void*>(data), it->second.size);
     }
   };
@@ -780,10 +954,19 @@ void* MMapWeightCacheProvider::OffsetToAddr(const size_t offset) {
 
 void MMapWeightCacheProvider::Release() {
   buffer_address_to_identifier_.clear();
+  buffer_remaps_.clear();
   cache_key_to_offset_.clear();
   mmap_handles_.clear();
   mmap_buffer_base_offset_ = 0;
+  file_descriptor_.Close();
   builder_ = WeightCacheBuilder();
+  cache_miss_handler_ = CacheMissHandler();
+  offset_to_addr_.clear();
+  in_memory_cache_enabled_ = false;
+  is_in_memory_build_step_ = false;
+  in_memory_build_handle_.UnMap();
+  in_memory_build_used_ = 0;
+  in_memory_build_offsets_.clear();
 }
 
 size_t MMapWeightCacheProvider::look_up(
@@ -825,7 +1008,7 @@ enum xnn_status MMapWeightCacheProvider::alias_data(void* context, void* alias,
 
 PackIdentifier MMapWeightCacheProvider::BuildPackIdentifier(
     const xnn_weights_cache_look_up_key& key) {
-  const auto get_buffer_id = [&](const void* buffer) -> size_t {
+  const auto get_buffer_id = [&](const void* buffer) -> uint64_t {
     if (!buffer) {
       return PackIdentifier::kNoId;
     }

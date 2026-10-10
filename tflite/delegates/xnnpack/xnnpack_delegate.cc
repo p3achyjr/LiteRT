@@ -634,6 +634,92 @@ TfLiteStatus DefineXNNPACKValue(TfLiteContext* context, xnn_subgraph_t subgraph,
   return kTfLiteOk;
 }
 
+struct SharedInMemoryWeightCache {
+  std::mutex mutex;  // NOLINT(build/c++11)
+  MMapWeightCacheProvider provider;
+};
+
+struct ModelWeightCacheKey {
+  bool enable_fp16 = false;
+  std::vector<std::pair<uintptr_t, size_t>> constant_buffers;
+
+  bool operator==(const ModelWeightCacheKey& other) const {
+    return enable_fp16 == other.enable_fp16 &&
+           constant_buffers == other.constant_buffers;
+  }
+};
+
+struct ModelWeightCacheKeyHash {
+  size_t operator()(const ModelWeightCacheKey& key) const {
+    size_t h = std::hash<bool>{}(key.enable_fp16);
+    for (const auto& [addr, size] : key.constant_buffers) {
+      h ^= std::hash<uintptr_t>{}(addr) + 0x9e3779b9 + (h << 6) + (h >> 2);
+      h ^= std::hash<size_t>{}(size) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    }
+    return h;
+  }
+};
+
+std::shared_ptr<SharedInMemoryWeightCache> AcquireSharedInMemoryWeightCache(
+    const tflite::Subgraph* subgraph, bool force_fp16) {
+  if (subgraph == nullptr || subgraph->GetSubgraphs() == nullptr) {
+    return nullptr;
+  }
+  ModelWeightCacheKey key;
+  key.enable_fp16 = force_fp16 || subgraph->GetAllowFp16PrecisionForFp32();
+  for (const std::unique_ptr<tflite::Subgraph>& sg :
+       *subgraph->GetSubgraphs()) {
+    if (sg == nullptr || sg->context() == nullptr ||
+        sg->context()->tensors == nullptr) {
+      continue;
+    }
+    const TfLiteTensor* tensors = sg->context()->tensors;
+    const size_t num_tensors = sg->context()->tensors_size;
+    for (size_t i = 0; i < num_tensors; ++i) {
+      const TfLiteTensor& t = tensors[i];
+      if (t.allocation_type == kTfLiteMmapRo && t.data.data != nullptr &&
+          t.bytes > 0) {
+        key.constant_buffers.emplace_back(
+            reinterpret_cast<uintptr_t>(t.data.data), t.bytes);
+      }
+    }
+  }
+  if (key.constant_buffers.empty()) {
+    return nullptr;
+  }
+  std::sort(key.constant_buffers.begin(), key.constant_buffers.end());
+  key.constant_buffers.erase(
+      std::unique(key.constant_buffers.begin(), key.constant_buffers.end()),
+      key.constant_buffers.end());
+
+  static auto* const kRegistryMutex = new std::mutex();  // NOLINT(build/c++11)
+  static auto* const kRegistry =
+      new std::unordered_map<ModelWeightCacheKey,
+                             std::weak_ptr<SharedInMemoryWeightCache>,
+                             ModelWeightCacheKeyHash>();
+
+  std::lock_guard<std::mutex> lock(*kRegistryMutex);  // NOLINT(build/c++11)
+  for (auto it = kRegistry->begin(); it != kRegistry->end();) {
+    if (it->second.expired()) {
+      it = kRegistry->erase(it);
+    } else {
+      ++it;
+    }
+  }
+  if (auto it = kRegistry->find(key); it != kRegistry->end()) {
+    if (std::shared_ptr<SharedInMemoryWeightCache> existing =
+            it->second.lock()) {
+      return existing;
+    }
+  }
+  auto shared = std::make_shared<SharedInMemoryWeightCache>();
+  if (!shared->provider.LoadOrStartBuild(kInMemoryCachePath)) {
+    return nullptr;
+  }
+  (*kRegistry)[std::move(key)] = shared;
+  return shared;
+}
+
 class Subgraph;
 
 class Delegate {
@@ -738,6 +824,44 @@ class Delegate {
                    "XNNPack weight cache not enabled.");
       }
     }
+  }
+
+  void MaybeEnableDefaultInMemoryWeightCache(const tflite::Subgraph* subgraph) {
+    if (subgraph == nullptr || subgraph->GetSubgraphs() == nullptr ||
+        subgraph->GetSubgraphs()->size() <= 1) {
+      return;
+    }
+    if (options_.weights_cache != nullptr ||
+        options_.weight_cache_provider != nullptr ||
+        options_.weight_cache_file_path != nullptr ||
+        options_.weight_cache_file_descriptor > 0 ||
+        weight_cache_provider_->IsActive() ||
+        !weight_cache_provider_.owning() ||
+        !TfLiteXNNPackDelegateCanUseInMemoryWeightCacheProvider()) {
+      return;
+    }
+    if (std::shared_ptr<SharedInMemoryWeightCache> shared =
+            AcquireSharedInMemoryWeightCache(subgraph, force_fp16())) {
+      shared_in_memory_weight_cache_ = std::move(shared);
+      weight_cache_provider_ = maybe_unique_ptr<MMapWeightCacheProvider>(
+          &shared_in_memory_weight_cache_->provider, kNotOwned);
+    } else if (!weight_cache_provider_->LoadOrStartBuild(kInMemoryCachePath)) {
+      return;
+    }
+    options_.weights_cache =
+        reinterpret_cast<TfLiteXNNPackDelegateWeightsCache*>(
+            &weight_cache_provider_->GetCacheProvider());
+    options_.weight_cache_file_path =
+        weight_cache_provider_->GetFilePath().data();
+    TFLITE_LOG(tflite::TFLITE_LOG_VERBOSE,
+               "XNNPack in-memory weight cache automatically enabled for "
+               "multi-subgraph model (%zu subgraphs).",
+               subgraph->GetSubgraphs()->size());
+  }
+
+  const std::shared_ptr<SharedInMemoryWeightCache>&
+  shared_in_memory_weight_cache() const {
+    return shared_in_memory_weight_cache_;
   }
 
   ~Delegate() {
@@ -943,6 +1067,11 @@ class Delegate {
 
   TfLiteXNNPackDelegateOptions options_{};
   std::shared_ptr<std::mutex> workspace_mutex_ = std::make_shared<std::mutex>();
+
+  // Shared in-memory weight cache across Delegate instances targeting the same
+  // multi-subgraph model. Declared before weight_cache_provider_ so the shared
+  // provider outlives the non-owning handle.
+  std::shared_ptr<SharedInMemoryWeightCache> shared_in_memory_weight_cache_;
 
   // If no weight cache is provided and a cache is set in the delegate options,
   // this will be used as a weight cache.
@@ -1516,6 +1645,11 @@ class Subgraph {
                            "XNNPack delegate failed to stop cache build step.");
         return nullptr;
       }
+      if (delegate.options_.weight_cache_lock_memory &&
+          !delegate.weight_cache_provider_->LockMemory()) {
+        TFLITE_LOG_PROD(tflite::TFLITE_LOG_ERROR,
+                        "XNNPack weight cache could not be locked in memory.");
+      }
     }
     if (status != xnn_status_success) {
       TF_LITE_KERNEL_LOG(context, "failed to create XNNPACK runtime");
@@ -1558,7 +1692,15 @@ class Subgraph {
           return kTfLiteError;
         }
       }
-      status = xnn_reshape_runtime(runtime_.get());
+      {
+        std::unique_lock<std::mutex> shared_cache_lock;  // NOLINT(build/c++11)
+        if (shared_in_memory_weight_cache_ != nullptr) {
+          shared_cache_lock =
+              std::unique_lock<std::mutex>(  // NOLINT(build/c++11)
+                  shared_in_memory_weight_cache_->mutex);
+        }
+        status = xnn_reshape_runtime(runtime_.get());
+      }
       if (status != xnn_status_success) {
         TF_LITE_KERNEL_LOG(context,
                            "XNNPack delegate failed to reshape runtime");
@@ -1720,6 +1862,12 @@ class Subgraph {
         status = xnn_setup_runtime_v2(runtime_.get(), external_values.size(),
                                       external_values.data());
       } else {
+        std::unique_lock<std::mutex> shared_cache_lock;  // NOLINT(build/c++11)
+        if (shared_in_memory_weight_cache_ != nullptr) {
+          shared_cache_lock =
+              std::unique_lock<std::mutex>(  // NOLINT(build/c++11)
+                  shared_in_memory_weight_cache_->mutex);
+        }
         status = xnn_setup_runtime(runtime_.get(), external_values.size(),
                                    external_values.data());
       }
@@ -7189,6 +7337,7 @@ class Subgraph {
            std::vector<int> outputs,
            std::unordered_map<int, uint32_t> tflite_tensor_to_xnnpack)
       : allocated_scales_(delegate.TransferTempAllocatedScales()),
+        shared_in_memory_weight_cache_(delegate.shared_in_memory_weight_cache_),
         runtime_(runtime, &xnn_delete_runtime),
         inputs_(std::move(inputs)),
         outputs_(std::move(outputs)),
@@ -7203,7 +7352,8 @@ class Subgraph {
 
   Subgraph(Delegate& delegate,
            std::unique_ptr<MoeExpertsDelegateKernel> moe_kernel)
-      : runtime_(nullptr, &xnn_delete_runtime),
+      : shared_in_memory_weight_cache_(delegate.shared_in_memory_weight_cache_),
+        runtime_(nullptr, &xnn_delete_runtime),
         moe_kernel_(std::move(moe_kernel)),
         enable_subgraph_reshaping_(delegate.enable_subgraph_reshaping()),
         workspace_mutex_(delegate.workspace_mutex_) {}
@@ -7212,6 +7362,8 @@ class Subgraph {
   // Must be declared before runtime_ so it outlives runtime_ during
   // destruction.
   std::vector<std::vector<float>> allocated_scales_;
+  // Keep any shared in-memory weight cache alive for the lifetime of runtime_.
+  std::shared_ptr<SharedInMemoryWeightCache> shared_in_memory_weight_cache_;
   // XNNPACK Runtime (subgraph + workspace) with smart-pointer for lifetime
   // management.
   std::unique_ptr<xnn_runtime, decltype(&xnn_delete_runtime)> runtime_{
@@ -7252,6 +7404,7 @@ TfLiteIntArray* Delegate::PrepareOpsToDelegate(
     tflite::Subgraph* this_subgraph =
         reinterpret_cast<tflite::Subgraph*>(context->impl_);
     subgraph_index = this_subgraph->GetSubgraphIndex();
+    MaybeEnableDefaultInMemoryWeightCache(this_subgraph);
   }
   if (subgraph_index >= static_unpacked_data_.size()) {
     static_unpacked_data_.resize(subgraph_index + 1);
@@ -7786,12 +7939,22 @@ const TfLiteRegistration kSubgraphRegistration = {
 };
 
 TfLiteStatus DelegatePrepare(TfLiteContext* context, TfLiteDelegate* delegate) {
+  auto* xnnpack_delegate =
+      static_cast<::tflite::xnnpack::Delegate*>(delegate->data_);
+  if (context != nullptr && context->impl_ != nullptr) {
+    xnnpack_delegate->MaybeEnableDefaultInMemoryWeightCache(
+        reinterpret_cast<const tflite::Subgraph*>(context->impl_));
+  }
+  std::unique_lock<std::mutex> shared_cache_lock;  // NOLINT(build/c++11)
+  if (xnnpack_delegate->shared_in_memory_weight_cache() != nullptr) {
+    shared_cache_lock = std::unique_lock<std::mutex>(  // NOLINT(build/c++11)
+        xnnpack_delegate->shared_in_memory_weight_cache()->mutex);
+  }
   std::unique_ptr<TfLiteIntArray, void (*)(TfLiteIntArray*)> moe_ops_to_replace(
       nullptr, TfLiteIntArrayFree);
   TfLiteIntArray* moe_ops_to_replace_raw = nullptr;
   TfLiteIntArray* ops_to_replace =
-      static_cast<::tflite::xnnpack::Delegate*>(delegate->data_)
-          ->PrepareOpsToDelegate(context, &moe_ops_to_replace_raw);
+      xnnpack_delegate->PrepareOpsToDelegate(context, &moe_ops_to_replace_raw);
   moe_ops_to_replace.reset(moe_ops_to_replace_raw);
   if (ops_to_replace == nullptr) {
     return kTfLiteError;

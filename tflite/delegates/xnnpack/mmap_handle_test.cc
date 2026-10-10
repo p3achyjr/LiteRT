@@ -18,6 +18,7 @@ limitations under the License.
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <utility>
 
@@ -266,6 +267,26 @@ TEST(MMapHandleTest, MemoryLockAndUnlock) {
   }
 
   EXPECT_THAT(handle, ElementsAreArray(payload));
+}
+
+TEST(MMapHandleTest, MapResizeAndFinalizeAnonymous) {
+  const std::string payload = "Anonymous weight cache test payload.";
+  MMapHandle handle;
+  ASSERT_TRUE(handle.MapAnonymous(payload.size(), "xnnpack-weights-cache"));
+  ASSERT_TRUE(handle.IsMapped());
+  EXPECT_GE(handle.size(), payload.size());
+  std::memcpy(handle.data(), payload.data(), payload.size());
+
+  const size_t grown_size = handle.size() * 2 + 128;
+  ASSERT_TRUE(handle.ResizeAnonymous(grown_size, payload.size(),
+                                     "xnnpack-weights-cache"));
+  EXPECT_GE(handle.size(), grown_size);
+  EXPECT_EQ(std::memcmp(handle.data(), payload.data(), payload.size()), 0);
+
+  ASSERT_TRUE(
+      handle.FinalizeAnonymous(payload.size(), "xnnpack-weights-cache"));
+  EXPECT_GE(handle.size(), payload.size());
+  EXPECT_EQ(std::memcmp(handle.data(), payload.data(), payload.size()), 0);
 }
 
 }  // namespace

@@ -19,6 +19,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include "tflite/c/c_api_types.h"
 #include "tflite/core/model_building.h"
+#include "tflite/core/subgraph.h"
 #include "tflite/delegates/xnnpack/weight_cache.h"
 #include "tflite/delegates/xnnpack/xnnpack_delegate.h"
 #include "tflite/interpreter.h"
@@ -139,6 +140,139 @@ TEST_F(XnnpackDelegateWeightCacheTest,
   EXPECT_EQ(interpreter.ModifyGraphWithDelegate(std::move(xnnpack_delegate)),
             kTfLiteOk);
   EXPECT_FALSE(shared_weight_cache_provider.IsActive());
+}
+
+TEST_F(XnnpackDelegateWeightCacheTest,
+       DefaultInMemoryCacheAutomaticallyDeduplicatesMultiSubgraphWeights) {
+  model_builder::ModelBuilder builder;
+  model_builder::Quantization weights_quantization =
+      model_builder::AffineQuantization{/*zero_points=*/{0},
+                                        /*scales=*/{1.45},
+                                        /*axis=*/1};
+  auto shared_weights = NewConstantBuffer(builder);
+  Assign<kTfLiteInt8>(
+      shared_weights, {3, 4},
+      std::vector<int>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+      std::move(weights_quantization));
+
+  for (int s = 0; s < 3; ++s) {
+    auto graph = NewGraph(builder);
+    auto inputs = NewInput(graph, kTfLiteFloat32);
+    SetShape(inputs, {2, 4});
+    auto out = FullyConnected(inputs, shared_weights);
+    model_builder::MarkOutputs({out});
+  }
+
+  tflite::Interpreter interpreter;
+  builder.Build(interpreter);
+  ASSERT_GE(interpreter.subgraphs_size(), 3);
+
+  TfLiteXNNPackDelegateOptions xnnpack_options = GetXNNPackOptions();
+  std::unique_ptr<TfLiteDelegate, void (*)(TfLiteDelegate*)> xnnpack_delegate(
+      TfLiteXNNPackDelegateCreate(&xnnpack_options),
+      TfLiteXNNPackDelegateDelete);
+  ASSERT_EQ(interpreter.ModifyGraphWithDelegate(std::move(xnnpack_delegate)),
+            kTfLiteOk);
+
+  for (int s = 0; s < 3; ++s) {
+    Subgraph* subgraph = interpreter.subgraph(s);
+    ASSERT_NE(subgraph, nullptr);
+    ASSERT_EQ(subgraph->AllocateTensors(), kTfLiteOk);
+    TfLiteTensor* input = subgraph->tensor(subgraph->inputs()[0]);
+    for (int i = 0; i < 8; ++i) {
+      input->data.f[i] = static_cast<float>(i);
+    }
+    ASSERT_EQ(subgraph->Invoke(), kTfLiteOk);
+  }
+
+  const TfLiteTensor* out0 =
+      interpreter.subgraph(0)->tensor(interpreter.subgraph(0)->outputs()[0]);
+  const TfLiteTensor* out1 =
+      interpreter.subgraph(1)->tensor(interpreter.subgraph(1)->outputs()[0]);
+  const TfLiteTensor* out2 =
+      interpreter.subgraph(2)->tensor(interpreter.subgraph(2)->outputs()[0]);
+  for (int i = 0; i < 6; ++i) {
+    EXPECT_FLOAT_EQ(out0->data.f[i], out1->data.f[i]);
+    EXPECT_FLOAT_EQ(out0->data.f[i], out2->data.f[i]);
+  }
+}
+
+TEST_F(XnnpackDelegateWeightCacheTest,
+       DefaultInMemoryCacheDeduplicatesAcrossDelegates) {
+  std::vector<int8_t> shared_weight_bytes = {1, 2, 3, 4,  5,  6,
+                                             7, 8, 9, 10, 11, 12};
+  auto build_multi_subgraph_interpreter =
+      [&](tflite::Interpreter& interpreter,
+          model_builder::ModelBuilder& builder) {
+        model_builder::Quantization weights_quantization =
+            model_builder::AffineQuantization{/*zero_points=*/{0},
+                                              /*scales=*/{1.45},
+                                              /*axis=*/1};
+        auto shared_weights = NewConstantBuffer(builder);
+        model_builder::Assign(
+            shared_weights, kTfLiteInt8, {3, 4},
+            reinterpret_cast<char*>(shared_weight_bytes.data()), +[](char*) {},
+            shared_weight_bytes.size(), std::move(weights_quantization));
+        for (int s = 0; s < 2; ++s) {
+          auto graph = NewGraph(builder);
+          auto inputs = NewInput(graph, kTfLiteFloat32);
+          SetShape(inputs, {2, 4});
+          auto out = FullyConnected(inputs, shared_weights);
+          model_builder::MarkOutputs({out});
+        }
+        builder.Build(interpreter);
+      };
+
+  model_builder::ModelBuilder builder0;
+  tflite::Interpreter interpreter0;
+  build_multi_subgraph_interpreter(interpreter0, builder0);
+  ASSERT_GE(interpreter0.subgraphs_size(), 2);
+
+  model_builder::ModelBuilder builder1;
+  tflite::Interpreter interpreter1;
+  build_multi_subgraph_interpreter(interpreter1, builder1);
+  ASSERT_GE(interpreter1.subgraphs_size(), 2);
+
+  TfLiteXNNPackDelegateOptions xnnpack_options = GetXNNPackOptions();
+  std::unique_ptr<TfLiteDelegate, void (*)(TfLiteDelegate*)> delegate0(
+      TfLiteXNNPackDelegateCreate(&xnnpack_options),
+      TfLiteXNNPackDelegateDelete);
+  std::unique_ptr<TfLiteDelegate, void (*)(TfLiteDelegate*)> delegate1(
+      TfLiteXNNPackDelegateCreate(&xnnpack_options),
+      TfLiteXNNPackDelegateDelete);
+
+  ASSERT_EQ(interpreter0.ModifyGraphWithDelegate(delegate0.get()), kTfLiteOk);
+  ASSERT_EQ(interpreter1.ModifyGraphWithDelegate(delegate1.get()), kTfLiteOk);
+
+  if (TfLiteXNNPackDelegateCanUseInMemoryWeightCacheProvider()) {
+    const TfLiteXNNPackDelegateOptions* opts0 =
+        TfLiteXNNPackDelegateGetOptions(delegate0.get());
+    const TfLiteXNNPackDelegateOptions* opts1 =
+        TfLiteXNNPackDelegateGetOptions(delegate1.get());
+    ASSERT_NE(opts0, nullptr);
+    ASSERT_NE(opts1, nullptr);
+    EXPECT_NE(opts0->weights_cache, nullptr);
+    EXPECT_EQ(opts0->weights_cache, opts1->weights_cache);
+  }
+
+  Subgraph* subgraph0 = interpreter0.subgraph(0);
+  Subgraph* subgraph1 = interpreter1.subgraph(1);
+  ASSERT_EQ(subgraph0->AllocateTensors(), kTfLiteOk);
+  ASSERT_EQ(subgraph1->AllocateTensors(), kTfLiteOk);
+  for (int i = 0; i < 8; ++i) {
+    subgraph0->tensor(subgraph0->inputs()[0])->data.f[i] =
+        static_cast<float>(i);
+    subgraph1->tensor(subgraph1->inputs()[0])->data.f[i] =
+        static_cast<float>(i);
+  }
+  ASSERT_EQ(subgraph0->Invoke(), kTfLiteOk);
+  ASSERT_EQ(subgraph1->Invoke(), kTfLiteOk);
+
+  const TfLiteTensor* out0 = subgraph0->tensor(subgraph0->outputs()[0]);
+  const TfLiteTensor* out1 = subgraph1->tensor(subgraph1->outputs()[0]);
+  for (int i = 0; i < 6; ++i) {
+    EXPECT_FLOAT_EQ(out0->data.f[i], out1->data.f[i]);
+  }
 }
 
 }  // namespace
