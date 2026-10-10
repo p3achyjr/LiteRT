@@ -632,10 +632,12 @@ Expected<void> LiteRtCompiledModelT::RestoreExternalWeightsForCpu() {
     return {};
   }
 
-  // Iterate through all subgraphs and restore external weights to tensors.
-  for (int subgraph_idx = 0; subgraph_idx < interp_->subgraphs_size();
-       ++subgraph_idx) {
+  // Iterate through active subgraphs and restore external weights to tensors.
+  for (int subgraph_idx : active_subgraph_indices_) {
     auto* subgraph = interp_->subgraph(subgraph_idx);
+    if (subgraph == nullptr) {
+      continue;
+    }
     const auto& external_buffer_ids =
         subgraph->GetExternalTensorBufferIdentifiers();
 
@@ -1172,7 +1174,31 @@ Expected<void> LiteRtCompiledModelT::InitializeActiveSubgraphs(
   active_subgraph_indices_.clear();
   selected_signature_keys_.clear();
 
+  const bool has_signature_defs = !interp_->signature_keys().empty();
+  const auto resolve_signature_subgraph =
+      [this, has_signature_defs](const std::string& key) -> int {
+    return (!has_signature_defs && key == litert::kDefaultSignatureKey)
+               ? 0
+               : interp_->GetSubgraphIndexFromSignature(key.c_str());
+  };
+
   if (options == nullptr || options->selected_signature_keys.empty()) {
+    std::vector<int> root_subgraph_indices;
+    root_subgraph_indices.reserve(signature_keys_.size());
+    for (const std::string* key : signature_keys_) {
+      if (key == nullptr) continue;
+      const int subgraph_index = resolve_signature_subgraph(*key);
+      if (subgraph_index >= 0 && subgraph_index < interp_->subgraphs_size()) {
+        root_subgraph_indices.push_back(subgraph_index);
+      }
+    }
+    if (!root_subgraph_indices.empty() &&
+        interp_->GetReachableSubgraphIndices(
+            root_subgraph_indices, &active_subgraph_indices_) == kTfLiteOk &&
+        !active_subgraph_indices_.empty()) {
+      return {};
+    }
+    active_subgraph_indices_.clear();
     active_subgraph_indices_.reserve(interp_->subgraphs_size());
     for (int subgraph_index = 0; subgraph_index < interp_->subgraphs_size();
          ++subgraph_index) {
@@ -1183,24 +1209,12 @@ Expected<void> LiteRtCompiledModelT::InitializeActiveSubgraphs(
 
   const std::vector<std::string>& selected_keys =
       options->selected_signature_keys;
-  if (selected_keys.empty()) {
-    return Unexpected(kLiteRtStatusErrorInvalidArgument,
-                      "Selected signature keys must not be empty.");
-  }
-
   selected_signature_keys_.reserve(selected_keys.size());
-  absl::flat_hash_set<int> root_subgraph_indices;
+  std::vector<int> root_subgraph_indices;
   root_subgraph_indices.reserve(selected_keys.size());
 
-  const bool has_signature_defs = !interp_->signature_keys().empty();
   for (const std::string& signature_key : selected_keys) {
-    int subgraph_index = -1;
-    if (!has_signature_defs && signature_key == litert::kDefaultSignatureKey) {
-      subgraph_index = 0;
-    } else {
-      subgraph_index =
-          interp_->GetSubgraphIndexFromSignature(signature_key.c_str());
-    }
+    const int subgraph_index = resolve_signature_subgraph(signature_key);
     if (subgraph_index < 0) {
       return Unexpected(
           kLiteRtStatusErrorInvalidArgument,
@@ -1213,17 +1227,19 @@ Expected<void> LiteRtCompiledModelT::InitializeActiveSubgraphs(
                                      subgraph_index, "."));
     }
     selected_signature_keys_.insert(signature_key);
-    root_subgraph_indices.insert(subgraph_index);
+    root_subgraph_indices.push_back(subgraph_index);
   }
 
-  // The active set is intentionally equal to the deduplicated root set in the
-  // initial implementation. Transitive callee discovery is a follow-up.
-  active_subgraph_indices_.reserve(root_subgraph_indices.size());
-  for (int subgraph_index = 0; subgraph_index < interp_->subgraphs_size();
-       ++subgraph_index) {
-    if (root_subgraph_indices.contains(subgraph_index)) {
-      active_subgraph_indices_.push_back(subgraph_index);
-    }
+  // Activate the selected signatures' entry subgraphs plus every subgraph they
+  // can invoke (control-flow bodies, composite decompositions, CALL_ONCE
+  // initializers, ...), so that delegation and the CPU/delegation accounting
+  // cover exactly the code the selected signatures can run.
+  if (interp_->GetReachableSubgraphIndices(
+          root_subgraph_indices, &active_subgraph_indices_) != kTfLiteOk) {
+    return Unexpected(
+        kLiteRtStatusErrorInvalidArgument,
+        "Failed to resolve the subgraphs reachable from the selected "
+        "signatures; the model references an invalid subgraph index.");
   }
   return {};
 }
@@ -1243,6 +1259,9 @@ Expected<void> LiteRtCompiledModelT::ValidateSignatureIsActive(
 void LiteRtCompiledModelT::MarkSignatureIoTensorsNonCpu() {
   const bool has_signature_defs = !interp_->signature_keys().empty();
   for (const std::string* signature_key : signature_keys_) {
+    if (!ValidateSignatureIsActive(*signature_key)) {
+      continue;
+    }
     const int subgraph_index =
         has_signature_defs
             ? interp_->GetSubgraphIndexFromSignature(signature_key->c_str())
