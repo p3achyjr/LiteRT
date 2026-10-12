@@ -335,6 +335,13 @@ struct MlDriftDelegateOptions {
   // subgraphs into single fused odml.short_conv_step nodes.
   // Disabled by default to avoid unexpected graph mutations on general models.
   bool enable_short_conv_step_fusion = false;
+
+  // OpenCL only.
+  //
+  // If true, wraps internal delegate I/O tensors with page-aligned host
+  // allocations via CL_MEM_USE_HOST_PTR on supported architectures (e.g.
+  // PowerVR) to eliminate CPU-GPU copy and readback overhead.
+  bool enable_host_ptr_io_buffers = false;
 };
 
 namespace litert::ml_drift {

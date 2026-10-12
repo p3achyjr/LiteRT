@@ -117,6 +117,12 @@ class GpuBackendOpenCl : public GpuBackend {
       GpuMemoryHandle gpu_memory) override;
   absl::StatusOr<std::unique_ptr<GpuIOBuffer>> CreateIOBufferWithSize(
       ::ml_drift::DataType data_type, size_t size, bool input) override;
+  bool SupportsHostPtrIOBuffer(bool input) const override;
+  absl::StatusOr<std::unique_ptr<GpuIOBuffer>> CreateHostIOBuffer(
+      ::ml_drift::DataType data_type, size_t size, bool input) override;
+  absl::StatusOr<std::unique_ptr<GpuIOBuffer>> CreateIOBufferWithHostPtr(
+      ::ml_drift::DataType data_type, size_t size, void* host_ptr,
+      bool input) override;
   absl::StatusOr<std::unique_ptr<Tensor2BufferConverter>>
   CreateTensor2BufferConverter(
       const ::ml_drift::TensorDescriptor& src_desc,
@@ -222,8 +228,10 @@ class GpuTensorWrapperOpenCl : public GpuTensorWrapper {
 class GpuIOBufferOpenCl : public GpuIOBuffer {
  public:
   explicit GpuIOBufferOpenCl(::ml_drift::cl::Environment* env,
-                             ::ml_drift::cl::Buffer&& buffer);
-  ~GpuIOBufferOpenCl() override = default;
+                             ::ml_drift::cl::Buffer&& buffer,
+                             bool is_host_ptr = false, void* host_ptr = nullptr,
+                             bool owns_host_ptr = false);
+  ~GpuIOBufferOpenCl() override;
 
   // Implementation of GpuIOBuffer.
   absl::Status Read(absl::Span<uint8_t> data) override;
@@ -234,9 +242,15 @@ class GpuIOBufferOpenCl : public GpuIOBuffer {
   // Underlying mutable OpenCL buffer.
   ::ml_drift::cl::Buffer& cl_buffer() { return buffer_; }
 
+  bool IsHostPtr() const override { return is_host_ptr_; }
+  void* GetHostPtr() const override { return host_ptr_; }
+
  private:
   ::ml_drift::cl::Environment* const env_;
   ::ml_drift::cl::Buffer buffer_;
+  const bool is_host_ptr_ = false;
+  void* const host_ptr_ = nullptr;
+  const bool owns_host_ptr_ = false;
 };
 
 class Tensor2BufferConverterOpenCl : public Tensor2BufferConverter {

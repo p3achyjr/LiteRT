@@ -273,6 +273,27 @@ class GpuBackend {
   virtual absl::StatusOr<std::unique_ptr<GpuIOBuffer>> CreateIOBufferWithSize(
       ::ml_drift::DataType data_type, size_t size, bool input) = 0;
 
+  // Returns true if the backend supports host pointer I/O buffers (zero-copy)
+  // for the specified input/output direction.
+  // Extensible to other GPU vendors and backends.
+  virtual bool SupportsHostPtrIOBuffer(bool input) const { return false; }
+
+  // Creates a `GpuIOBuffer` backed by host-accessible zero-copy memory.
+  // The returned buffer owns the host memory.
+  // Returns nullptr if not supported by the backend or device.
+  virtual absl::StatusOr<std::unique_ptr<GpuIOBuffer>> CreateHostIOBuffer(
+      ::ml_drift::DataType data_type, size_t size, bool input) {
+    return nullptr;
+  }
+
+  // Creates a `GpuIOBuffer` wrapping a host pointer for zero-copy IO.
+  // Falls back to CreateIOBufferWithSize if not supported.
+  virtual absl::StatusOr<std::unique_ptr<GpuIOBuffer>>
+  CreateIOBufferWithHostPtr(::ml_drift::DataType data_type, size_t size,
+                            void* host_ptr, bool input) {
+    return CreateIOBufferWithSize(data_type, size, input);
+  }
+
   // Creates a `Tensor2BufferConverter`.
   // [OPTIONAL] Only for no-external tensor mode in LiteRT delegates or for
   // legacy TfLite delegates.
@@ -451,6 +472,10 @@ class GpuIOBuffer {
   // GpuBackend::WaitForCompletion() should be called before deallocating the
   // buffer of data.
   virtual absl::Status Write(absl::Span<const uint8_t> data) = 0;
+
+  // Returns true if this buffer directly wraps a host CPU pointer (zero-copy).
+  virtual bool IsHostPtr() const { return false; }
+  virtual void* GetHostPtr() const { return nullptr; }
 };
 
 // Converter (i.e. data transferer with potential memory layout change) from a
