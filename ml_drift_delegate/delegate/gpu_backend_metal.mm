@@ -437,26 +437,42 @@ absl::StatusOr<::ml_drift::GpuSpatialTensor*> GpuInferenceContextMetal::GetSpati
 
 absl::Status GpuInferenceContextMetal::BindSpatialTensor(::ml_drift::ValueId tensor_id,
                                                          ::ml_drift::GpuSpatialTensor* tensor) {
-  ABSL_RETURN_IF_ERROR(
-      ctx_->SetTensor(tensor_id, static_cast<::ml_drift::metal::MetalSpatialTensor*>(tensor)));
+  auto* old_tensor = ctx_->GetTensor(tensor_id);
+  id<MTLBuffer> old_buffer = old_tensor != nullptr ? old_tensor->GetBufferHandle() : nil;
+  id<MTLTexture> old_texture = old_tensor != nullptr ? old_tensor->GetTextureHandle() : nil;
+
+  auto* metal_tensor = static_cast<::ml_drift::metal::MetalSpatialTensor*>(tensor);
+  ABSL_RETURN_IF_ERROR(ctx_->SetTensor(tensor_id, metal_tensor));
   if (@available(macOS 15.0, iOS 18.0, *)) {
     id<MTLResidencySet> res_set = backend_->residency_set();
     if (res_set != nil) {
       @autoreleasepool {
-        auto* metal_tensor = static_cast<::ml_drift::metal::MetalSpatialTensor*>(tensor);
-        if (metal_tensor != nullptr) {
-          bool added = false;
-          if (metal_tensor->GetBufferHandle() != nil) {
-            [res_set addAllocation:metal_tensor->GetBufferHandle()];
-            added = true;
+        id<MTLBuffer> new_buffer = metal_tensor != nullptr ? metal_tensor->GetBufferHandle() : nil;
+        id<MTLTexture> new_texture =
+            metal_tensor != nullptr ? metal_tensor->GetTextureHandle() : nil;
+        bool changed = false;
+        if (old_buffer != new_buffer) {
+          if (old_buffer != nil) {
+            [res_set removeAllocation:old_buffer];
+            changed = true;
           }
-          if (metal_tensor->GetTextureHandle() != nil) {
-            [res_set addAllocation:metal_tensor->GetTextureHandle()];
-            added = true;
+          if (new_buffer != nil) {
+            [res_set addAllocation:new_buffer];
+            changed = true;
           }
-          if (added) {
-            [res_set commit];
+        }
+        if (old_texture != new_texture) {
+          if (old_texture != nil) {
+            [res_set removeAllocation:old_texture];
+            changed = true;
           }
+          if (new_texture != nil) {
+            [res_set addAllocation:new_texture];
+            changed = true;
+          }
+        }
+        if (changed) {
+          [res_set commit];
         }
       }
     }
