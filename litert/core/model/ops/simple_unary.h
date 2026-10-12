@@ -177,6 +177,25 @@ inline void ReferenceDequantize(const InT* input_data, size_t num_elements,
   }
 }
 
+inline void ReferenceGelu(const float* input_data, size_t num_elements,
+                          bool approximate, float* output_data) {
+  if (approximate) {
+    // Tanh-based GELU approximation:
+    // 0.5 * x * (1 + tanh(sqrt(2 / pi) * (x + 0.044715 * x^3))).
+    constexpr float kGeluCubicCoeff = 0.044715f;
+    const float kSqrtTwoOverPi = std::sqrt(2.0f / static_cast<float>(M_PI));
+    ReferenceUnaryGeneric(
+        input_data, num_elements, output_data, [kSqrtTwoOverPi](float val) {
+          return 0.5f * val *
+                 (1.0f + std::tanh(kSqrtTwoOverPi *
+                                   (val + kGeluCubicCoeff * val * val * val)));
+        });
+  } else {
+    ReferenceUnaryGeneric(input_data, num_elements, output_data, [](float val) {
+      return 0.5f * val * (1.0f + std::erf(val / std::sqrt(2.0f)));
+    });
+  }
+}
 }  // namespace litert::internal
 
 #endif  // ODML_LITERT_LITERT_CORE_MODEL_OPS_SIMPLE_UNARY_H_
