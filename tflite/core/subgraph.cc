@@ -23,6 +23,7 @@ limitations under the License.
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <string>
@@ -68,6 +69,37 @@ namespace {
 
 constexpr size_t kExtraNodeCapacity = 10;
 constexpr float kTensorCapacityInc = 1.1f;
+
+size_t GetTypeAlignment(TfLiteType type) {
+  switch (type) {
+    case kTfLiteInt64:
+      return alignof(int64_t);
+    case kTfLiteUInt64:
+      return alignof(uint64_t);
+    case kTfLiteFloat64:
+      return alignof(double);
+    case kTfLiteComplex128:
+      return alignof(TfLiteComplex128);
+    case kTfLiteFloat32:
+      return alignof(float);
+    case kTfLiteInt32:
+      return alignof(int32_t);
+    case kTfLiteUInt32:
+      return alignof(uint32_t);
+    case kTfLiteComplex64:
+      return alignof(TfLiteComplex64);
+    case kTfLiteInt16:
+      return alignof(int16_t);
+    case kTfLiteUInt16:
+      return alignof(uint16_t);
+    case kTfLiteFloat16:
+      return alignof(TfLiteFloat16);
+    case kTfLiteBFloat16:
+      return alignof(TfLiteBFloat16);
+    default:
+      return 1;
+  }
+}
 
 struct TfLiteQuantizationDeleter {
   void operator()(TfLiteQuantization* q) {
@@ -1968,6 +2000,23 @@ TfLiteStatus Subgraph::SetTensorParametersReadOnly(
         &context_,
         tflite::BytesRequired(type, dims, ndims, &required_bytes, &context_));
     TF_LITE_ENSURE(&context_, required_bytes <= bytes);
+  }
+
+  if (buffer != nullptr && bytes > 0 &&
+      reinterpret_cast<uintptr_t>(buffer) % GetTypeAlignment(type) != 0) {
+    // The extra bytes are required by XNNPack/YNNPack to avoid out-of-bounds
+    // SIMD reads (matching TfLiteTensorAllocationSize in common.cc).
+    constexpr size_t kExtraAllocationBytes = 16;
+    if (bytes > std::numeric_limits<size_t>::max() - kExtraAllocationBytes) {
+      return kTfLiteError;
+    }
+    std::unique_ptr<char, FreeDeleter> aligned_buffer(
+        static_cast<char*>(malloc(bytes + kExtraAllocationBytes)));
+    TF_LITE_ENSURE(&context_, aligned_buffer != nullptr);
+    memcpy(aligned_buffer.get(), buffer, bytes);
+    memset(aligned_buffer.get() + bytes, 0, kExtraAllocationBytes);
+    buffer = aligned_buffer.get();
+    aligned_ro_buffers_.push_back(std::move(aligned_buffer));
   }
 
   TfLiteTensor& tensor = context_.tensors[tensor_index];

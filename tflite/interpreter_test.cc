@@ -343,6 +343,53 @@ TEST(BasicInterpreter, CheckAlignment) {
   }
 }
 
+TEST(BasicInterpreter, CheckReadOnlyAlignment) {
+  struct {
+    TfLiteType type;
+    size_t alignment;
+  } cases[] = {
+      {kTfLiteFloat32, alignof(float)},
+      {kTfLiteInt32, alignof(int32_t)},
+      {kTfLiteUInt32, alignof(uint32_t)},
+      {kTfLiteInt64, alignof(int64_t)},
+      {kTfLiteUInt64, alignof(uint64_t)},
+      {kTfLiteFloat64, alignof(double)},
+      {kTfLiteInt16, alignof(int16_t)},
+      {kTfLiteFloat16, alignof(TfLiteFloat16)},
+  };
+
+  alignas(16) char raw_buffer[64] = {};
+  const int64_t expected_i64[2] = {6, -7};
+  // Place expected_i64 at non-overlapping misaligned offsets: an odd offset
+  // (raw_buffer + 1) and a 4-byte-aligned but not 8-byte-aligned offset
+  // (raw_buffer + 20).
+  memcpy(raw_buffer + 1, expected_i64, sizeof(expected_i64));
+  memcpy(raw_buffer + 20, expected_i64, sizeof(expected_i64));
+
+  for (const auto& test : cases) {
+    Interpreter interpreter;
+    ASSERT_EQ(interpreter.AddTensors(2), kTfLiteOk);
+    TfLiteQuantizationParams quant = {};
+    ASSERT_EQ(interpreter.SetTensorParametersReadOnly(
+                  0, test.type, "", {2}, quant, raw_buffer + 1, 2 * 8),
+              kTfLiteOk);
+    ASSERT_EQ(interpreter.SetTensorParametersReadOnly(
+                  1, test.type, "", {2}, quant, raw_buffer + 20, 2 * 8),
+              kTfLiteOk);
+
+    for (int i = 0; i < 2; ++i) {
+      const TfLiteTensor& tensor = *interpreter.tensor(i);
+      EXPECT_EQ(tensor.allocation_type, kTfLiteMmapRo);
+      EXPECT_EQ(reinterpret_cast<uintptr_t>(tensor.data.raw) % test.alignment,
+                0u);
+      if (test.type == kTfLiteInt64) {
+        EXPECT_EQ(tensor.data.i64[0], expected_i64[0]);
+        EXPECT_EQ(tensor.data.i64[1], expected_i64[1]);
+      }
+    }
+  }
+}
+
 TEST(BasicInterpreter, CheckArenaAllocation) {
   Interpreter interpreter;
   ASSERT_EQ(interpreter.AddTensors(10), kTfLiteOk);
