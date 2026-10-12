@@ -22,7 +22,7 @@ NS_ASSUME_NONNULL_BEGIN
  * Describes the allocation requirements for an input or output @c LRTTensorBuffer, as specified by
  * the compiled model and hardware accelerator.
  */
-@interface LRTTensorBufferRequirements : NSObject
+@interface LRTTensorBufferRequirements : NSObject <NSCopying>
 
 /**
  * Buffer storage types (@c LRTTensorBufferType boxed in @c NSNumber) supported for this tensor.
@@ -42,6 +42,31 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, copy, readonly) NSArray<NSNumber *> *strides;
 
 - (instancetype)init NS_UNAVAILABLE;
++ (instancetype)new NS_UNAVAILABLE;
+
+/**
+ * Initializes tensor buffer requirements with the specified storage types, size, alignment, and
+ * strides.
+ *
+ * @param supportedBufferTypes Supported @c LRTTensorBufferType values boxed in @c NSNumber.
+ * @param bufferSize Minimum required buffer size in bytes.
+ * @param alignment Required memory alignment in bytes.
+ * @param strides Per-dimension buffer strides boxed in @c NSNumber.
+ * @return An initialized @c LRTTensorBufferRequirements instance.
+ */
+- (instancetype)initWithSupportedBufferTypes:(NSArray<NSNumber *> *)supportedBufferTypes
+                                  bufferSize:(NSUInteger)bufferSize
+                                   alignment:(NSUInteger)alignment
+                                     strides:(NSArray<NSNumber *> *)strides
+    NS_DESIGNATED_INITIALIZER;
+
+/**
+ * Returns whether the receiver is equal to another @c LRTTensorBufferRequirements instance.
+ *
+ * @param otherRequirements The requirements instance to compare with the receiver.
+ * @return @c YES if both instances have identical buffer types, size, alignment, and strides.
+ */
+- (BOOL)isEqualToRequirements:(LRTTensorBufferRequirements *)otherRequirements;
 
 @end
 

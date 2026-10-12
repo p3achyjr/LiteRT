@@ -21,7 +21,7 @@ NS_ASSUME_NONNULL_BEGIN
 @interface LRTTensorBuffer (Internal)
 
 /** Creates an Objective-C @c LRTTensorBuffer wrapping a C++ @c litert::TensorBuffer object. */
-+ (nullable instancetype)tensorBufferWithCppTensorBuffer:(litert::TensorBuffer)cppTensorBuffer;
++ (nullable instancetype)tensorBufferWithCPPTensorBuffer:(litert::TensorBuffer)cppTensorBuffer;
 
 /** Pointer to the underlying C++ @c litert::TensorBuffer object. */
 - (nullable litert::TensorBuffer *)cppTensorBuffer;
