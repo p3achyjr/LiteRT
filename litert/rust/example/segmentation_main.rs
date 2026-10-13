@@ -49,6 +49,8 @@ struct SegmentationModel {
 impl SegmentationModel {
     fn initialize(model_path: &str) -> Result<SegmentationModel, litert::Error> {
         let env = litert::EnvironmentBuilder::build_default()?;
+        let accelerators = env.get_available_accelerators()?;
+        println!("Available accelerators: {:?}", accelerators);
         let m = litert::Model::create_model_from_file(&env, model_path)?;
         let options = litert::Options::create_with_accelerator(litert::LiteRtHwAccelerator::Cpu)?;
         let cm = litert::CompiledModel::create(&env, &m, &options)?;

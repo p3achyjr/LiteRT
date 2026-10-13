@@ -14,6 +14,7 @@
 
 use crate::bindings::*;
 use crate::call_check_status;
+use crate::compiled_model::LiteRtHwAccelerator;
 use crate::error::{Error, ErrorCause};
 use std::any::{Any, TypeId};
 use std::ffi::CString;
@@ -32,6 +33,7 @@ pub enum OptionTag {
     WebGpuQueue,
     MetalDevice,
     MetalCommandQueue,
+    SystemGpuAcceleratorHandle,
     // TODO(mgubin): Add VulkanEnvironment.
 }
 
@@ -52,6 +54,9 @@ impl OptionTag {
             Self::WebGpuQueue => LiteRtEnvOptionTag_kLiteRtEnvOptionTagWebGpuQueue,
             Self::MetalDevice => LiteRtEnvOptionTag_kLiteRtEnvOptionTagMetalDevice,
             Self::MetalCommandQueue => LiteRtEnvOptionTag_kLiteRtEnvOptionTagMetalCommandQueue,
+            Self::SystemGpuAcceleratorHandle => {
+                LiteRtEnvOptionTag_kLiteRtEnvOptionTagSystemGpuAcceleratorHandle
+            }
         }
     }
 }
@@ -192,6 +197,54 @@ impl Environment {
         );
         Ok(Self { raw_environment: raw_environment_ptr, cstring_storage: builder.cstring_storage })
     }
+
+    /// Returns the list of hardware accelerators available in this environment.
+    pub fn get_available_accelerators(&self) -> Result<Vec<LiteRtHwAccelerator>, Error> {
+        let mut num_accelerators: LiteRtParamIndex = 0;
+        call_check_status!(
+            // SAFETY: self.raw_environment is always valid, it's guaranteed to be initialized by
+            // create* function.
+            unsafe { LiteRtGetNumAccelerators(self.raw_environment, &mut num_accelerators) },
+            ErrorCause::GetNumAccelerators
+        );
+
+        let mut accelerators = Vec::with_capacity(num_accelerators);
+        for i in 0..num_accelerators {
+            let mut accelerator: LiteRtAccelerator = std::ptr::null_mut();
+            call_check_status!(
+                // SAFETY: self.raw_environment is valid and i is within [0, num_accelerators).
+                unsafe { LiteRtGetAccelerator(self.raw_environment, i, &mut accelerator) },
+                ErrorCause::GetAccelerator
+            );
+
+            let mut hardware_support: LiteRtHwAcceleratorSet = 0;
+            call_check_status!(
+                // SAFETY: accelerator is valid as returned by LiteRtGetAccelerator.
+                unsafe { LiteRtGetAcceleratorHardwareSupport(accelerator, &mut hardware_support) },
+                ErrorCause::GetAcceleratorHardwareSupport
+            );
+
+            if (hardware_support
+                & (LiteRtHwAccelerators_kLiteRtHwAcceleratorCpu as LiteRtHwAcceleratorSet))
+                != 0
+            {
+                accelerators.push(LiteRtHwAccelerator::Cpu);
+            }
+            if (hardware_support
+                & (LiteRtHwAccelerators_kLiteRtHwAcceleratorGpu as LiteRtHwAcceleratorSet))
+                != 0
+            {
+                accelerators.push(LiteRtHwAccelerator::Gpu);
+            }
+            if (hardware_support
+                & (LiteRtHwAccelerators_kLiteRtHwAcceleratorNpu as LiteRtHwAcceleratorSet))
+                != 0
+            {
+                accelerators.push(LiteRtHwAccelerator::Npu);
+            }
+        }
+        Ok(accelerators)
+    }
 }
 
 impl Drop for Environment {
@@ -207,6 +260,7 @@ impl Drop for Environment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn test_environment_options_builder() {
         let environment = EnvironmentBuilder::new()
@@ -218,7 +272,20 @@ mod tests {
             .expect("Valid add_option")
             .add_option(OptionTag::CompilerPluginLibraryDir, "/tmp/plugin")
             .expect("Valid add_option")
+            .add_option(OptionTag::SystemGpuAcceleratorHandle, true)
+            .expect("Valid add_option")
             .build();
         assert_eq!(environment.is_ok(), true);
+    }
+
+    #[test]
+    fn test_get_available_accelerators() {
+        let environment =
+            EnvironmentBuilder::build_default().expect("Failed to create environment");
+        let accelerators =
+            environment.get_available_accelerators().expect("Failed to get available accelerators");
+        // CPU accelerator is always available by default.
+        assert!(!accelerators.is_empty());
+        assert!(accelerators.contains(&LiteRtHwAccelerator::Cpu));
     }
 }

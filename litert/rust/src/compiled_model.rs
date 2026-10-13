@@ -27,6 +27,7 @@ pub struct Options {
 }
 
 /// Hardware accelerators that can be used for inference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiteRtHwAccelerator {
     None,
     Cpu,
@@ -296,6 +297,41 @@ impl CompiledModel {
         );
         Ok(ran_in_parallel_thread)
     }
+    /// Returns true if the model is fully accelerated for all the selected HW accelerator(s).
+    ///
+    /// For example, if both GPU and NPU are selected and the model is only delegated to GPU,
+    /// this method will still return true.
+    pub fn is_fully_accelerated(&self) -> Result<bool, Error> {
+        let mut fully_accelerated = false;
+        call_check_status!(
+            // SAFETY: self.raw_compiled_model is valid because it's created by calling the create() function.
+            unsafe {
+                LiteRtCompiledModelIsFullyAccelerated(
+                    self.raw_compiled_model,
+                    &mut fully_accelerated,
+                )
+            },
+            ErrorCause::IsCompiledModelFullyAccelerated
+        );
+        Ok(fully_accelerated)
+    }
+
+    /// Returns true if the model is fully accelerated on non-CPU accelerators
+    /// (e.g. 100% delegated on GPU or NPU with zero CPU execution).
+    pub fn is_non_cpu_fully_accelerated(&self) -> Result<bool, Error> {
+        let mut non_cpu_fully_accelerated = false;
+        call_check_status!(
+            // SAFETY: self.raw_compiled_model is valid because it's created by calling the create() function.
+            unsafe {
+                LiteRtCompiledModelIsNonCpuFullyAccelerated(
+                    self.raw_compiled_model,
+                    &mut non_cpu_fully_accelerated,
+                )
+            },
+            ErrorCause::IsCompiledModelNonCpuFullyAccelerated
+        );
+        Ok(non_cpu_fully_accelerated)
+    }
 }
 
 impl Drop for CompiledModel {
@@ -305,5 +341,42 @@ impl Drop for CompiledModel {
         unsafe {
             LiteRtDestroyCompiledModel(self.raw_compiled_model);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hw_accelerator_to_c_enum() {
+        assert_eq!(
+            LiteRtHwAccelerator::None.to_c_enum(),
+            LiteRtHwAccelerators_kLiteRtHwAcceleratorNone
+        );
+        assert_eq!(
+            LiteRtHwAccelerator::Cpu.to_c_enum(),
+            LiteRtHwAccelerators_kLiteRtHwAcceleratorCpu
+        );
+        assert_eq!(
+            LiteRtHwAccelerator::Gpu.to_c_enum(),
+            LiteRtHwAccelerators_kLiteRtHwAcceleratorGpu
+        );
+        assert_eq!(
+            LiteRtHwAccelerator::Npu.to_c_enum(),
+            LiteRtHwAccelerators_kLiteRtHwAcceleratorNpu
+        );
+    }
+
+    #[test]
+    fn test_options_create_with_accelerator() {
+        let options = Options::create_with_accelerator(LiteRtHwAccelerator::Cpu);
+        assert!(options.is_ok());
+    }
+
+    #[test]
+    fn test_options_default() {
+        let options = Options::default();
+        assert!(options.is_ok());
     }
 }
