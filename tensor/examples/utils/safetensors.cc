@@ -1121,7 +1121,11 @@ bool validate_data_offsets(const safetensors_t& st, std::string& err) {
     databuffersize = st.storage.size();
   }
 
-  size_t ntensors{0};
+  // The JSON header is an object: its key order says nothing about the data
+  // layout (e.g. MLX doesn't write the tensors in offset order). The data
+  // buffer must end where the tensor that ends last ends.
+  size_t max_end{0};
+  bool has_data{false};
   // Iterate with key insertion order.
   for (size_t i = 0; i < st.tensors.size(); i++) {
     std::string key = st.tensors.keys()[i];
@@ -1170,15 +1174,14 @@ bool validate_data_offsets(const safetensors_t& st, std::string& err) {
       valid = false;
     }
 
-    ntensors++;
-    if (ntensors == st.tensors.size()) {
-      // Last element's data_offsets[1] must be equal to databuffer size.
-      if (tensor.data_offsets[1] != databuffersize) {
-        ss << "The last tensor's data_offset.END(" << tensor.data_offsets[1]
-           << ") must be equal to databufer size " << databuffersize << ".\n";
-        valid = false;
-      }
-    }
+    has_data = true;
+    max_end = (std::max)(max_end, tensor.data_offsets[1]);
+  }
+
+  if (has_data && max_end != databuffersize) {
+    ss << "The largest data_offsets.END(" << max_end
+       << ") must be equal to databufer size " << databuffersize << ".\n";
+    valid = false;
   }
 
   if (!valid) {

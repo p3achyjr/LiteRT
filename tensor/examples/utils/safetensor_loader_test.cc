@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "tensor/examples/utils/safetensor_loader.h"
 
+#include <cstdint>
+#include <filesystem>  // NOLINT
 #include <fstream>
 #include <memory>
 #include <optional>
@@ -484,6 +486,44 @@ TEST(SafetensorLoaderTest, MalformedJsonFails) {
       R"({ "quant_method": "compressed-tensors", format: })";
 
   SafetensorFileGuard file = CreateTempSafetensor(invalid_json);
+  EXPECT_THAT(SafetensorLoader::Load(file.GetPath()), Not(IsOk()));
+}
+
+// Writes a safetensors file with a raw JSON `header` followed by `data`.
+void WriteRawSafetensor(const std::filesystem::path& path,
+                        std::string header, const std::string& data) {
+  while (header.size() % 8 != 0) header.push_back(' ');
+  const uint64_t header_size = header.size();
+  std::ofstream out(path, std::ios::binary);
+  out.write(reinterpret_cast<const char*>(&header_size), sizeof(header_size));
+  out << header << data;
+}
+
+// JSON objects are unordered: writers such as MLX don't list the tensors in
+// data order.
+TEST(SafetensorLoaderTest, LoadsHeaderNotSortedByOffset) {
+  SafetensorFileGuard file = SafetensorFileGuard::CreateTemp();
+  const float values[] = {1.0f, 2.0f, 3.0f};
+  WriteRawSafetensor(
+      file.GetPath(),
+      R"({"b":{"dtype":"F32","shape":[2],"data_offsets":[4,12]},)"
+      R"("a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}})",
+      std::string(reinterpret_cast<const char*>(values), sizeof(values)));
+  LRT_TENSOR_ASSERT_OK_AND_ASSIGN(SafetensorLoader loader,
+                                  SafetensorLoader::Load(file.GetPath()));
+  LRT_TENSOR_ASSERT_OK_AND_ASSIGN(TensorHandle b, loader.LoadTensor("b"));
+  LRT_TENSOR_ASSERT_OK_AND_ASSIGN(Buffer & buffer, b.GetBuffer());
+  EXPECT_THAT(buffer.Lock().As<const float>(), ElementsAre(2.0f, 3.0f));
+}
+
+TEST(SafetensorLoaderTest, RejectsTrailingDataNotCoveredByTensors) {
+  SafetensorFileGuard file = SafetensorFileGuard::CreateTemp();
+  const float values[] = {1.0f, 2.0f, 3.0f};
+  WriteRawSafetensor(
+      file.GetPath(),
+      R"({"b":{"dtype":"F32","shape":[1],"data_offsets":[4,8]},)"
+      R"("a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}})",
+      std::string(reinterpret_cast<const char*>(values), sizeof(values)));
   EXPECT_THAT(SafetensorLoader::Load(file.GetPath()), Not(IsOk()));
 }
 
