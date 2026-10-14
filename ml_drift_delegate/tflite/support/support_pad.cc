@@ -111,6 +111,23 @@ bool IsPadSupported(const TfLiteContext* absl_nonnull context,
   if (!CheckTensorDtype(input_tensor, supported_dtypes, "inputs[0]", *error)) {
     return false;
   }
+  if (::tflite::IsConstantTensor(&input_tensor)) {
+    const bool quantized =
+        input_tensor.quantization.type == kTfLiteAffineQuantization;
+    const absl::flat_hash_set<TfLiteType> supported_const_dtypes = {
+        kTfLiteBool,
+        kTfLiteFloat16,
+        kTfLiteFloat32,
+        kTfLiteInt32,
+    };
+    if (!supported_const_dtypes.contains(input_tensor.type) &&
+        !(quantized && (input_tensor.type == kTfLiteInt8 ||
+                        input_tensor.type == kTfLiteUInt8))) {
+      *error = absl::StrCat("Unsupported constant dtype for inputs[0]: ",
+                            TfLiteTypeGetName(input_tensor.type));
+      return false;
+    }
+  }
   const TfLiteTensor& paddings_tensor = context->tensors[paddings_id];
   if (!CheckTensorDtype(paddings_tensor, {kTfLiteInt32}, "inputs[1]", *error)) {
     return false;
@@ -148,9 +165,6 @@ bool IsPadSupported(const TfLiteContext* absl_nonnull context,
   }
 
   // Check const inputs.
-  if (!CheckNotConstant(input_tensor, "inputs[0]", *error)) {
-    return false;
-  }
   if (!CheckIsConstant(paddings_tensor, "inputs[1]", *error)) {
     return false;
   }
